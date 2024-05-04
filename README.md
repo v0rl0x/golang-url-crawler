@@ -5,6 +5,6 @@ Steps:
 
 1. Upload golang file
 2. Make sure golang is installed by using: 
-3. go build url-crawler.go
+3. go build url-scan.go
 4. chmod 777 *
 5. ./url-scan -url="https://hackerone.com/" -output="output-hackerone.txt" -inscope="hackerone.com"
