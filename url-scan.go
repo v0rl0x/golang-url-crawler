@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -11,7 +12,10 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/chromedp/chromedp"
+	"github.com/chromedp/cdproto/network"
 	"golang.org/x/net/html"
 )
 
@@ -47,8 +51,10 @@ func (c *Crawler) Crawl(startURL string, outputFile string) {
 	c.Queue <- startURL
 	c.WG.Add(1)
 	go c.worker(inScopeCh, outScopeCh)
-
 	c.WG.Wait()
+
+	c.CrawlWithChrome(startURL, inScopeCh, outScopeCh)
+
 	close(inScopeCh)
 	close(outScopeCh)
 	log.Println("SCAN FINISHED")
@@ -62,109 +68,156 @@ func (c *Crawler) worker(inScopeCh, outScopeCh chan<- string) {
 }
 
 func (c *Crawler) processURL(pageURL string, inScopeCh, outScopeCh chan<- string) {
-    c.Mutex.Lock()
-    if c.Visited[pageURL] {
-        c.Mutex.Unlock()
-        return
-    }
-    c.Visited[pageURL] = true
-    c.Mutex.Unlock()
+	c.Mutex.Lock()
+	if c.Visited[pageURL] {
+		c.Mutex.Unlock()
+		return
+	}
+	c.Visited[pageURL] = true
+	c.Mutex.Unlock()
 
-    fmt.Println("Crawling:", pageURL)
-    resp, err := c.fetchURL(pageURL)
-    if err != nil || resp.StatusCode != http.StatusOK {
-        log.Printf("Error fetching URL %s: %v", pageURL, err)
-        return
-    }
-    defer resp.Body.Close()
+	fmt.Println("Crawling:", pageURL)
+	resp, err := c.fetchURL(pageURL)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		log.Printf("Error fetching URL %s: %v", pageURL, err)
+		return
+	}
+	defer resp.Body.Close()
 
-    doc, err := html.Parse(resp.Body)
-    if err != nil {
-        log.Printf("Error parsing HTML for URL %s: %v", pageURL, err)
-        return
-    }
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		log.Printf("Error parsing HTML for URL %s: %v", pageURL, err)
+		return
+	}
 
-    urls := c.extractLinks(pageURL, doc)
-    for _, u := range urls {
-        if c.isValidURL(u) {
-            if c.isInScope(u) {
-                log.Printf("In-scope URL found: %s", u)
-                inScopeCh <- "In-scope: " + u
-                c.Queue <- u
-                c.WG.Add(1)
-            } else {
-                log.Printf("Out-of-scope URL found: %s", u)
-                outScopeCh <- "Out-Of-Scope: " + u
-            }
-        } else {
-            log.Printf("Invalid URL found: %s", u)
-        }
-        if isCodeFile(u) {
-            c.extractURLsFromScript(u, inScopeCh, outScopeCh)
-        }
-    }
+	urls := c.extractLinks(pageURL, doc)
+	for _, u := range urls {
+		if c.isValidURL(u) {
+			if c.isInScope(u) {
+				log.Printf("In-scope URL found: %s", u)
+				inScopeCh <- "In-scope: " + u
+				c.Queue <- u
+				c.WG.Add(1)
+			} else {
+				log.Printf("Out-of-scope URL found: %s", u)
+				outScopeCh <- "Out-Of-Scope: " + u
+			}
+		} else {
+			log.Printf("Invalid URL found: %s", u)
+		}
+		if isCodeFile(u) {
+			c.extractURLsFromScript(u, inScopeCh, outScopeCh)
+		}
+	}
+}
+
+func (c *Crawler) CrawlWithChrome(startURL string, inScopeCh, outScopeCh chan<- string) {
+
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	ch := make(chan string, 100)
+
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		if ev, ok := ev.(*network.EventRequestWillBeSent); ok {
+			ch <- ev.Request.URL
+		}
+	})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := chromedp.Run(ctx,
+			network.Enable(),
+			chromedp.Navigate(startURL),
+			chromedp.Sleep(5*time.Second),
+		); err != nil {
+			log.Printf("Error navigating to URL %s with Chrome: %v", startURL, err)
+		}
+		close(ch)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for req := range ch {
+			log.Printf("URL found via Chrome: %s", req)
+			if c.isValidURL(req) {
+				if c.isInScope(req) {
+					log.Printf("In-scope URL found via Chrome: %s", req)
+					inScopeCh <- "In-scope: " + req
+				} else {
+					log.Printf("Out-of-scope URL found via Chrome: %s", req)
+					outScopeCh <- "Out-Of-Scope: " + req
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
 }
 
 func (c *Crawler) extractLinks(base string, n *html.Node) []string {
-    var urls []string
-    if n.Type == html.ElementNode {
-        switch n.Data {
-        case "a", "link", "img", "iframe", "frame", "embed", "script", "source", "track", "video", "audio", "applet", "object", "area", "base", "input", "form":
-            for _, a := range n.Attr {
-                if a.Key == "href" || a.Key == "src" || a.Key == "data" || a.Key == "action" {
-                    absoluteURL := c.formatURL(base, a.Val)
-                    urls = append(urls, absoluteURL)
-                }
-            }
-        case "meta":
-            for _, a := range n.Attr {
-                if a.Key == "content" && (strings.Contains(a.Val, "url=") || strings.Contains(a.Val, "URL=")) {
-                    absoluteURL := c.formatURL(base, strings.Split(a.Val, "=")[1])
-                    urls = append(urls, absoluteURL)
-                }
-            }
-        case "button":
-            for _, a := range n.Attr {
-                if a.Key == "formaction" {
-                    absoluteURL := c.formatURL(base, a.Val)
-                    urls = append(urls, absoluteURL)
-                }
-            }
-        case "blockquote", "del", "ins", "q":
-            for _, a := range n.Attr {
-                if a.Key == "cite" {
-                    absoluteURL := c.formatURL(base, a.Val)
-                    urls = append(urls, absoluteURL)
-                }
-            }
-        case "command":
-            for _, a := range n.Attr {
-                if a.Key == "icon" {
-                    absoluteURL := c.formatURL(base, a.Val)
-                    urls = append(urls, absoluteURL)
-                }
-            }
-        case "data":
-            for _, a := range n.Attr {
-                if a.Key == "value" {
-                    absoluteURL := c.formatURL(base, a.Val)
-                    urls = append(urls, absoluteURL)
-                }
-            }
-        }
-    }
+	var urls []string
+	if n.Type == html.ElementNode {
+		switch n.Data {
+		case "a", "link", "img", "iframe", "frame", "embed", "script", "source", "track", "video", "audio", "applet", "object", "area", "base", "input", "form":
+			for _, a := range n.Attr {
+				if a.Key == "href" || a.Key == "src" || a.Key == "data" || a.Key == "action" {
+					absoluteURL := c.formatURL(base, a.Val)
+					urls = append(urls, absoluteURL)
+				}
+			}
+		case "meta":
+			for _, a := range n.Attr {
+				if a.Key == "content" && (strings.Contains(a.Val, "url=") || strings.Contains(a.Val, "URL=")) {
+					absoluteURL := c.formatURL(base, strings.Split(a.Val, "=")[1])
+					urls = append(urls, absoluteURL)
+				}
+			}
+		case "button":
+			for _, a := range n.Attr {
+				if a.Key == "formaction" {
+					absoluteURL := c.formatURL(base, a.Val)
+					urls = append(urls, absoluteURL)
+				}
+			}
+		case "blockquote", "del", "ins", "q":
+			for _, a := range n.Attr {
+				if a.Key == "cite" {
+					absoluteURL := c.formatURL(base, a.Val)
+					urls = append(urls, absoluteURL)
+				}
+			}
+		case "command":
+			for _, a := range n.Attr {
+				if a.Key == "icon" {
+					absoluteURL := c.formatURL(base, a.Val)
+					urls = append(urls, absoluteURL)
+				}
+			}
+		case "data":
+			for _, a := range n.Attr {
+				if a.Key == "value" {
+					absoluteURL := c.formatURL(base, a.Val)
+					urls = append(urls, absoluteURL)
+				}
+			}
+		}
+	}
 
-    for child := n.FirstChild; child != nil; child = child.NextSibling {
-        urls = append(urls, c.extractLinks(base, child)...)
-    }
-    return urls
+	for child := n.FirstChild; child != nil; child = child.NextSibling {
+		urls = append(urls, c.extractLinks(base, child)...)
+	}
+	return urls
 }
 
 func isCodeFile(u string) bool {
 	codeExtensions := []string{
-		".js", ".jsp", ".xml", ".html", ".htm", ".php", ".asp", ".aspx", ".css", ".json", 
-		".txt", ".md", ".yaml", ".csv", ".doc", ".docx", ".pdf", ".ppt", ".pptx", ".xls", 
-		".xlsx", ".ts", ".py", ".rb", ".java", ".c", ".h", ".cs", ".swift", ".kt", 
+		".js", ".jsp", ".xml", ".html", ".htm", ".php", ".asp", ".aspx", ".css", ".json",
+		".txt", ".md", ".yaml", ".csv", ".doc", ".docx", ".pdf", ".ppt", ".pptx", ".xls",
+		".xlsx", ".ts", ".py", ".rb", ".java", ".c", ".h", ".cs", ".swift", ".kt",
 		".pl", ".sh", ".bat", ".go"}
 
 	for _, ext := range codeExtensions {
@@ -176,45 +229,68 @@ func isCodeFile(u string) bool {
 }
 
 func (c *Crawler) extractURLsFromScript(scriptURL string, inScopeCh, outScopeCh chan<- string) {
-    resp, err := c.fetchURL(scriptURL)
-    if err != nil || resp.StatusCode != http.StatusOK {
-        log.Printf("Error fetching script URL %s: %v", scriptURL, err)
-        return
-    }
-    defer resp.Body.Close()
+	resp, err := c.fetchURL(scriptURL)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		log.Printf("Error fetching script URL %s: %v", scriptURL, err)
+		return
+	}
+	defer resp.Body.Close()
 
-    bodyBytes, err := io.ReadAll(resp.Body)
-    if err != nil {
-        log.Printf("Error reading script body for URL %s: %v", scriptURL, err)
-        return
-    }
-    body := string(bodyBytes)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading script body for URL %s: %v", scriptURL, err)
+		return
+	}
+	body := string(bodyBytes)
 
-    urlRegex := regexp.MustCompile(`https?://[^\s"']+`)
-    urls := urlRegex.FindAllString(body, -1)
+	urlRegex := regexp.MustCompile(`http[s]?://[^\s"']+`)
+	urls := urlRegex.FindAllString(body, -1)
 
-    for _, u := range urls {
-        log.Printf("URL found in script: %s", u)
-        if c.isInScope(u) {
-            log.Printf("In-scope URL found: %s", u)
-            inScopeCh <- "In-scope: " + u
-        } else {
-            log.Printf("Out-of-scope URL found: %s", u)
-            outScopeCh <- "Out-Of-Scope: " + u
-        }
-    }
+	seen := make(map[string]bool)
+	for _, u := range urls {
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+
+		log.Printf("URL found in script: %s", u)
+		if c.isInScope(u) {
+			log.Printf("In-scope URL found: %s", u)
+			inScopeCh <- "In-scope: " + u
+		} else {
+			log.Printf("Out-of-scope URL found: %s", u)
+			outScopeCh <- "Out-Of-Scope: " + u
+		}
+	}
 }
 
 func (c *Crawler) fetchURL(pageURL string) (*http.Response, error) {
-	client := &http.Client{}
+	var redirectURL string
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			redirectURL = req.URL.String()
+			log.Printf("Redirected from %s to %s", via[len(via)-1].URL, redirectURL)
+			return nil
+		},
+	}
+
 	req, err := http.NewRequest("GET", pageURL, nil)
 	if err != nil {
+		log.Printf("Error creating request for URL %s: %v", pageURL, err)
 		return nil, err
 	}
 
-	// Custom user agent can be added here, chrome on windows for simplicity and acceptance
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
 	resp, err := client.Do(req)
+
+	if err != nil && redirectURL != "" {
+
+		log.Printf("Error fetching URL %s: %v, but redirected to %s", pageURL, err, redirectURL)
+	} else if err != nil {
+
+		log.Printf("Error fetching URL %s: %v", pageURL, err)
+	}
+
 	if err == nil && resp.StatusCode == http.StatusOK {
 		return resp, nil
 	}
@@ -227,6 +303,9 @@ func (c *Crawler) fetchURL(pageURL string) (*http.Response, error) {
 	}
 	req.URL = u
 	resp, err = client.Do(req)
+	if err != nil {
+		log.Printf("Error fetching URL %s: %v", u, err)
+	}
 	return resp, err
 }
 
@@ -244,7 +323,7 @@ func (c *Crawler) formatURL(base, href string) string {
 }
 
 func (c *Crawler) isValidURL(u string) bool {
-	match, _ := regexp.MatchString(`^https?://`, u)
+	match, _ := regexp.MatchString(`^http[s]?://`, u)
 	return match
 }
 
