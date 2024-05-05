@@ -36,7 +36,10 @@ func NewCrawler(inscope, outscope []string) *Crawler {
 }
 
 func (c *Crawler) Crawl(startURL string, outputFile string) {
-	go c.writeToFile(outputFile)
+	go func() {
+		c.writeToFile(outputFile)
+	}()
+
 	c.Queue <- startURL
 	c.WG.Add(1)
 	go c.worker()
@@ -268,6 +271,7 @@ func (c *Crawler) writeToFile(outputFile string) {
 	defer file.Close()
 
 	file.WriteString("--IN SCOPE URLS:---\n")
+
 	for u := range c.OutputCh {
 		if strings.HasPrefix(u, "In-scope") {
 			_, err := file.WriteString(u + "\n")
@@ -278,6 +282,7 @@ func (c *Crawler) writeToFile(outputFile string) {
 	}
 
 	file.WriteString("--OUT OF SCOPE URLS:---\n")
+
 	for u := range c.OutputCh {
 		if strings.HasPrefix(u, "Out-Of-Scope") {
 			_, err := file.WriteString(u + "\n")
